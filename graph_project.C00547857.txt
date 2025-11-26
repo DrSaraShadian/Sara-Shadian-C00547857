@@ -1,0 +1,512 @@
+# -*- coding: utf-8 -*-
+"""
+Data Mining Project – Final Code
+Author: Sara.Shadian (C00547857)
+Instructor: Dr. Min Shi
+
+Topic:
+    Graph Representation Learning and Node Classification
+Datasets:
+    Cora, Citeseer
+Methods:
+    DeepWalk 
+    GCN (Graph Convolutional Network)
+Metrics:
+    Accuracy,  AUC
+"""
+
+# ==========================================================
+# 0. Dependencies
+# ==========================================================
+!pip install -q gensim networkx wget
+
+import os
+import tarfile
+import random
+
+import numpy as np
+import scipy.sparse as sp
+import networkx as nx
+import wget
+
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import accuracy_score, roc_auc_score
+
+import tensorflow as tf
+from tensorflow.keras import Input, Model
+from tensorflow.keras.layers import Dropout
+
+from gensim.models import Word2Vec
+
+import matplotlib.pyplot as plt
+import pandas as pd
+
+
+# ==========================================================
+# 1. Reproducibility
+# ==========================================================
+def set_global_seed(seed: int = 42) -> None:
+    """Fix all random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+
+
+set_global_seed(42)
+
+
+# ==========================================================
+# 2. Dataset download & preprocessing
+# ==========================================================
+def download_and_extract(dataset_name: str, url: str) -> None:
+    """
+    Download and extract the citation dataset if it is not already present.
+    The archive creates a folder with the same name (e.g., 'cora', 'citeseer').
+    """
+    folder_name = dataset_name.lower()
+    if os.path.exists(folder_name):
+        return  # dataset is already available
+
+    print(f"Downloading {dataset_name} from {url} ...")
+    archive_path = wget.download(url)
+    print("\nExtracting archive...")
+    with tarfile.open(archive_path, "r:gz") as archive:
+        archive.extractall()
+    print(f"{dataset_name} is ready.\n")
+
+
+def load_citation_dataset(dataset_name: str):
+    """
+    Load the citation dataset (Cora or Citeseer) from the extracted files.
+
+    Returns:
+        adj      : scipy sparse adjacency matrix (with self-loops)
+        features : numpy array of node features
+        labels   : numpy array of integer labels
+        graph_nx : NetworkX graph (undirected)
+    """
+    name = dataset_name.lower()
+
+    urls = {
+        "cora": "https://linqs-data.soe.ucsc.edu/public/lbc/cora.tgz",
+        "citeseer": "https://linqs-data.soe.ucsc.edu/public/lbc/citeseer.tgz",
+    }
+    download_and_extract(name, urls[name])
+
+    content_path = os.path.join(name, f"{name}.content")
+    cites_path = os.path.join(name, f"{name}.cites")
+
+    # ----- Load nodes, features, labels -----
+    content_data = np.genfromtxt(content_path, dtype=str)
+    node_ids = content_data[:, 0]
+    feature_matrix = content_data[:, 1:-1].astype(np.float32)
+    raw_labels = content_data[:, -1]
+
+    label_encoder = LabelEncoder()
+    labels = label_encoder.fit_transform(raw_labels)
+
+    # Map paper id to integer index [0..N-1]
+    node_id_to_idx = {nid: idx for idx, nid in enumerate(node_ids)}
+
+    # ----- Load edges -----
+    edges_raw = np.genfromtxt(cites_path, dtype=str)
+    if edges_raw.ndim == 1:
+        edges_raw = np.expand_dims(edges_raw, axis=0)
+
+    edges_idx = []
+    for src_id, dst_id in edges_raw:
+        if src_id in node_id_to_idx and dst_id in node_id_to_idx:
+            src = node_id_to_idx[src_id]
+            dst = node_id_to_idx[dst_id]
+            edges_idx.append((src, dst))
+
+    edges_idx = np.array(edges_idx, dtype=np.int32)
+
+    # ----- Build adjacency: symmetric + self-loops -----
+    num_nodes = len(node_ids)
+    adj = sp.coo_matrix(
+        (np.ones(len(edges_idx), dtype=np.float32), (edges_idx[:, 0], edges_idx[:, 1])),
+        shape=(num_nodes, num_nodes),
+        dtype=np.float32,
+    )
+    # Make symmetric
+    adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
+    # Add self-loops
+    adj = adj + sp.eye(num_nodes, dtype=np.float32)
+
+    # ----- Row-normalize features -----
+    features = feature_matrix.copy()
+    row_sums = features.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1.0
+    features /= row_sums
+
+    # Build NetworkX graph from adjacency
+    graph_nx = nx.from_scipy_sparse_array(adj)
+
+    return adj, features, labels, graph_nx
+
+
+# ==========================================================
+# 3. DeepWalk: random walks + Word2Vec
+# ==========================================================
+def perform_random_walks(
+    graph: nx.Graph,
+    walk_length: int = 40,
+    num_walks: int = 10,
+) -> list[list[str]]:
+    """
+    Generate random walks from each node in the graph.
+
+    Each walk is a sequence of node indices represented as strings
+    (to be used by gensim Word2Vec).
+    """
+    walks: list[list[str]] = []
+    nodes = list(graph.nodes())
+
+    for _ in range(num_walks):
+        random.shuffle(nodes)
+        for start_node in nodes:
+            walk = [start_node]
+            while len(walk) < walk_length:
+                neighbors = list(graph.neighbors(walk[-1]))
+                if not neighbors:
+                    break
+                next_node = random.choice(neighbors)
+                walk.append(next_node)
+            walks.append([str(n) for n in walk])
+
+    return walks
+
+
+def train_deepwalk_embeddings(
+    graph: nx.Graph,
+    dim: int = 128,
+    walk_length: int = 40,
+    num_walks: int = 10,
+    window: int = 5,
+    epochs: int = 5,
+) -> np.ndarray:
+    """
+    Train DeepWalk embeddings by:
+        1. Generating random walks
+        2. Training a Word2Vec model on the walks
+    """
+    walks = perform_random_walks(graph, walk_length=walk_length, num_walks=num_walks)
+
+    w2v_model = Word2Vec(
+        sentences=walks,
+        vector_size=dim,
+        window=window,
+        min_count=0,
+        sg=1,           # skip-gram
+        workers=4,
+        epochs=epochs,
+    )
+
+    num_nodes = graph.number_of_nodes()
+    embeddings = np.zeros((num_nodes, dim), dtype=np.float32)
+
+    for node in graph.nodes():
+        embeddings[node] = w2v_model.wv[str(node)]
+
+    return embeddings
+
+
+def evaluate_node_embeddings(
+    embeddings: np.ndarray,
+    labels: np.ndarray,
+    use_mlp: bool = False,
+) -> tuple[float, float]:
+    """
+    Evaluate node embeddings with a classifier (Logistic Regression or MLP).
+
+    Returns:
+        accuracy, macro_auc
+    """
+    X_train, X_test, y_train, y_test = train_test_split(
+        embeddings,
+        labels,
+        test_size=0.3,
+        stratify=labels,
+        random_state=42,
+    )
+
+    if use_mlp:
+        clf = MLPClassifier(
+            hidden_layer_sizes=(256, 128),
+            activation="relu",
+            solver="adam",
+            max_iter=500,
+            random_state=42,
+        )
+    else:
+        clf = LogisticRegression(
+            max_iter=1500,
+            solver="lbfgs",
+        )
+
+    clf.fit(X_train, y_train)
+    y_pred = clf.predict(X_test)
+    y_prob = clf.predict_proba(X_test)
+
+    acc = accuracy_score(y_test, y_pred)
+    auc = roc_auc_score(y_test, y_prob, multi_class="ovr")
+
+    return acc, auc
+
+
+# ==========================================================
+# 4. GCN implementation (Keras / TensorFlow)
+# ==========================================================
+def normalize_adjacency(adj: sp.coo_matrix) -> sp.coo_matrix:
+    """
+    Compute D^{-1/2} A D^{-1/2} for a given adjacency A with self-loops.
+
+    A is expected to be a scipy sparse matrix.
+    """
+    adj = sp.coo_matrix(adj)
+    degrees = np.array(adj.sum(axis=1)).flatten()
+
+    d_inv_sqrt = np.power(degrees, -0.5)
+    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.0
+
+    D_inv_sqrt = sp.diags(d_inv_sqrt)
+    adj_norm = D_inv_sqrt.dot(adj).dot(D_inv_sqrt)
+
+    return adj_norm.tocoo()
+
+
+class GraphConvolutionLayer(tf.keras.layers.Layer):
+    """
+    Simple GCN layer: H' = σ(Â H W)
+
+    where:
+        Â : normalized adjacency matrix
+        H : input features
+        W : learnable weight matrix
+    """
+
+    def __init__(self, output_dim, adj_norm, activation=None, **kwargs):
+        super().__init__(**kwargs)
+        self.output_dim = output_dim
+        self.adj_norm = tf.constant(adj_norm, dtype=tf.float32)
+        self.activation = tf.keras.activations.get(activation)
+
+    def build(self, input_shape):
+        self.kernel = self.add_weight(
+            name="kernel",
+            shape=(input_shape[-1], self.output_dim),
+            initializer="glorot_uniform",
+        )
+
+    def call(self, inputs):
+        support = tf.matmul(inputs, self.kernel)
+        out = tf.matmul(self.adj_norm, support)
+        if self.activation is not None:
+            out = self.activation(out)
+        return out
+
+
+def split_indices(
+    num_nodes: int,
+    train_ratio: float = 0.6,
+    val_ratio: float = 0.2,
+    seed: int = 42,
+):
+    """
+    Randomly split node indices into train/validation/test sets.
+    """
+    idx = np.arange(num_nodes)
+    rng = np.random.RandomState(seed)
+    rng.shuffle(idx)
+
+    train_end = int(train_ratio * num_nodes)
+    val_end = int((train_ratio + val_ratio) * num_nodes)
+
+    train_idx = idx[:train_end]
+    val_idx = idx[train_end:val_end]
+    test_idx = idx[val_end:]
+
+    train_mask = np.zeros(num_nodes, dtype=np.float32)
+    val_mask = np.zeros(num_nodes, dtype=np.float32)
+    test_mask = np.zeros(num_nodes, dtype=np.float32)
+
+    train_mask[train_idx] = 1.0
+    val_mask[val_idx] = 1.0
+    test_mask[test_idx] = 1.0
+
+    return train_idx, val_idx, test_idx, train_mask, val_mask, test_mask
+
+
+def build_gcn_model(
+    adj_norm: np.ndarray,
+    num_features: int,
+    num_classes: int,
+    hidden_units: int = 64,
+    dropout_rate: float = 0.5,
+    lr: float = 0.01,
+) -> tf.keras.Model:
+    """
+    Build a two-layer GCN model using the custom GraphConvolutionLayer.
+    """
+    inputs = Input(shape=(num_features,))
+    x = GraphConvolutionLayer(hidden_units, adj_norm, activation="relu")(inputs)
+    x = Dropout(dropout_rate)(x)
+    outputs = GraphConvolutionLayer(num_classes, adj_norm, activation="softmax")(x)
+
+    model = Model(inputs=inputs, outputs=outputs)
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+    return model
+
+
+def train_and_evaluate_gcn(adj, features, labels, dataset_name: str):
+    """
+    Train a two-layer GCN on the full graph (transductive setting)
+    and evaluate accuracy and macro AUC on the test split.
+    """
+    num_nodes, num_features = features.shape
+    num_classes = len(np.unique(labels))
+
+    adj_norm = normalize_adjacency(adj).toarray()
+
+    if dataset_name.lower() == "citeseer":
+        train_ratio, val_ratio, hidden_units = 0.7, 0.1, 128
+    else:
+        train_ratio, val_ratio, hidden_units = 0.6, 0.2, 64
+
+    train_idx, val_idx, test_idx, train_mask, val_mask, test_mask = \
+        split_indices(num_nodes, train_ratio, val_ratio)
+
+    model = build_gcn_model(
+        adj_norm=adj_norm,
+        num_features=num_features,
+        num_classes=num_classes,
+        hidden_units=hidden_units,
+        dropout_rate=0.5,
+        lr=0.01,
+    )
+
+    early_stop = tf.keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=30,
+        restore_best_weights=True,
+        verbose=1,
+    )
+
+    model.fit(
+        features,
+        labels,
+        sample_weight=train_mask,
+        epochs=400,
+        batch_size=num_nodes,
+        verbose=0,
+        validation_data=(features, labels, val_mask),
+        callbacks=[early_stop],
+    )
+
+    logits = model.predict(features, batch_size=num_nodes, verbose=0)
+    y_pred = logits.argmax(axis=1)
+
+    test_acc = accuracy_score(labels[test_idx], y_pred[test_idx])
+    test_auc = roc_auc_score(labels[test_idx], logits[test_idx], multi_class="ovr")
+
+    return test_acc, test_auc
+
+
+# ==========================================================
+# 5. Plotting helper for the report
+# ==========================================================
+def plot_results(final_results):
+    """
+    Plot bar charts for Accuracy and AUC for each (dataset, model) pair.
+    final_results is a list of: [dataset, model, accuracy, auc]
+    """
+    df = pd.DataFrame(final_results, columns=["Dataset", "Model", "Accuracy", "AUC"])
+
+    labels = [f"{ds.capitalize()}-{m}" for ds, m in zip(df["Dataset"], df["Model"])]
+    x = np.arange(len(df))
+
+    # Accuracy plot
+    plt.figure(figsize=(8, 4))
+    plt.bar(x, df["Accuracy"], alpha=0.85)
+    plt.xticks(x, labels, rotation=30, ha="right")
+    plt.ylim(0.0, 1.0)
+    plt.ylabel("Accuracy")
+    plt.title("Node Classification Accuracy (DeepWalk vs GCN)")
+    plt.tight_layout()
+    plt.show()
+
+    # AUC plot
+    plt.figure(figsize=(8, 4))
+    plt.bar(x, df["AUC"], alpha=0.85)
+    plt.xticks(x, labels, rotation=30, ha="right")
+    plt.ylim(0.0, 1.0)
+    plt.ylabel("Macro AUC (OvR)")
+    plt.title("Node Classification AUC (DeepWalk vs GCN)")
+    plt.tight_layout()
+    plt.show()
+
+
+# ==========================================================
+# 6. Main experiment loop
+# ==========================================================
+def run_experiments():
+    """
+    Run DeepWalk and GCN on both Cora and Citeseer.
+    Returns a list of [dataset_name, model_name, accuracy, auc].
+    """
+    final_results: list[list[float]] = []
+
+    for dataset_name in ["cora", "citeseer"]:
+        print(f"\n======= DATASET: {dataset_name.upper()} =======")
+
+        adj, features, labels, graph_nx = load_citation_dataset(dataset_name)
+        num_nodes, num_features = features.shape
+        num_classes = len(np.unique(labels))
+        print(f"Nodes: {num_nodes}, Features: {num_features}, Classes: {num_classes}")
+
+        # DeepWalk
+        print("[DeepWalk] Training embeddings...")
+        if dataset_name.lower() == "citeseer":
+            emb = train_deepwalk_embeddings(
+                graph_nx,
+                dim=256,
+                walk_length=80,
+                num_walks=20,
+                epochs=10,
+            )
+            dw_acc, dw_auc = evaluate_node_embeddings(emb, labels, use_mlp=True)
+        else:
+            emb = train_deepwalk_embeddings(graph_nx)
+            dw_acc, dw_auc = evaluate_node_embeddings(emb, labels, use_mlp=False)
+
+        print(f"[DeepWalk] Accuracy: {dw_acc:.4f}, AUC: {dw_auc:.4f}")
+        final_results.append([dataset_name, "DeepWalk", dw_acc, dw_auc])
+
+        # GCN
+        print("[GCN] Training model...")
+        gcn_acc, gcn_auc = train_and_evaluate_gcn(adj, features, labels, dataset_name)
+        print(f"[GCN] Accuracy: {gcn_acc:.4f}, AUC: {gcn_auc:.4f}")
+        final_results.append([dataset_name, "GCN", gcn_acc, gcn_auc])
+
+    print("\n=========== FINAL RESULTS ===========")
+    print("{:<10} {:<10} {:<12} {:<12}".format("Dataset", "Model", "Accuracy", "AUC"))
+    for ds, model, acc, auc in final_results:
+        print("{:<10} {:<10} {:<12.4f} {:<12.4f}".format(ds, model, acc, auc))
+
+    return final_results
+
+
+# ==========================================================
+# 7. Entry point
+# ==========================================================
+if __name__ == "__main__":
+    results = run_experiments()
+    plot_results(results)
